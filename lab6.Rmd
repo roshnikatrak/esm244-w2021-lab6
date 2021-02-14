@@ -1,0 +1,125 @@
+---
+title: "Lab 6"
+author: "Roshni Katrak-Adefowora"
+date: "2/13/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(janitor)
+library(sf)
+library(tmap)
+library(gstat)
+library(stars)
+```
+
+```{r}
+#read in CA depth of groundwater observations
+ca_dgw <- read_sf(here("ca_dgw"), layer = "F2013_DBGS_Points_20150720_093252") %>% 
+  clean_names()
+
+#check projection
+st_crs(ca_dgw)
+
+#read in CA counties data
+ca_counties <- read_sf(here("ca_counties"), layer = "CA_Counties_TIGER2016") %>% 
+  clean_names() %>% 
+  select(name)
+
+#check projection - has one but different from ca_dgw, need to transform to match ca_dgw
+st_crs(ca_counties)
+
+#transform crs to same as ca_dgw
+ca_counties <- st_transform(ca_counties, st_crs(ca_dgw))
+st_crs(ca_counties) #check crs
+```
+
+```{r}
+ggplot()+
+  geom_sf(data=ca_counties)+
+  geom_sf(data=ca_dgw, aes(color=dgbs))
+```
+
+```{r}
+#make interactive map
+tmap_mode("view") #can set to "plot" instead of "view" to make static map
+
+tm_shape(ca_dgw)+
+  tm_dots("dgbs") #point plot of dgbs
+```
+
+```{r}
+#only want san joaquin county, make single spatial polygon
+sj_county <- ca_counties %>% 
+  filter(name == "San Joaquin") #remember geometry will always stick to attribute
+```
+
+```{r}
+#find intersection between depth to groundwater data and outline of SJ county
+
+sj_depth <- ca_dgw %>% 
+  st_intersection(sj_county) #only keep depth to groundwater observations within sj_county polygon
+
+plot(sj_depth)
+plot(sj_county)
+
+ggplot()+
+  geom_sf(data=sj_county)+
+  geom_sf(data=sj_depth, aes(color=dgbs))
+```
+
+```{r}
+#if you have duplicates, you can't do spatial interpolation! Here's how you find duplicates:
+
+well_duplicates <- sj_depth %>% 
+  janitor::get_dupes(latitude, longitude) #will register as duplicate of both lat and long are same
+
+#remove duplicate wells from dataframe
+sj_depth <- sj_depth %>% 
+  filter(!local_well %in% well_duplicates$local_well)
+
+#check again for duplicates
+sj_depth %>% 
+  get_dupes(latitude, longitude)
+```
+
+### Create a variogram
+1) plot variogram based on our data.
+2) model it.
+```{r}
+sj_dgw_vgm <- variogram(dgbs ~ 1, data = sj_depth)
+
+plot(sj_dgw_vgm) #see inc in semi variance (decrease in correlation) between values of those observations
+
+#but we want continuous function, not discrete points, to work for our interpolation
+
+#find a model that fits this spatial variogram
+
+sj_dgw_vgm_fit <- fit.variogram(sj_dgw_vgm, model = vgm(nugget = 20, psill = 3000, range = 30, model = "Gau")) #need to give best estimates for range, nugget, psill, and model you think will fit
+
+sj_dgw_vgm_fit
+
+#how does it fit out data?
+plot(sj_dgw_vgm, sj_dgw_vgm_fit) #pretty good, maybe failing a bit on the upper end
+```
+
+### Spatial kriging (interpolation)
+```{r}
+#make grid that only contains area relevant over SJ county
+sj_grid <- st_bbox(sj_county) %>% #find mix/max lat/long values
+  st_as_stars(dx = 0.01, y = 0.01) %>% #want difference in x and y increments to be 0.01 (grid size??)
+  st_set_crs(4326) %>% 
+  st_crop(sj_county) #crop grid to outline of sj_county
+
+plot(sj_grid)
+```
+
+```{r}
+sj_dgw_krige <- krige(dgbs ~ 1, sj_depth, sj_grid, model = sj_dgw_vgm_fit)
+
+plot(sj_dgw_krige) #can see what it would look like if we used our variogram to predict across entire county
+```
+
